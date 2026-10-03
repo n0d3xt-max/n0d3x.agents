@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "id": "n0d3x.agents",
+  "name": "My Agents",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "license": "MIT",
+  "description": "Claude Code, Codex, Fireworks, OpenCode, Antigravity, Freebuff, Pi, Gemini, Crush, Copilot, Grok, Hermes, Cursor, Z.ai and Synthetic usage, limits, and pace in a native Omarchy bar panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "My Agents",
+    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription.",
+    "category": "AI",
+    "aliases": [
+      "agents",
+      "model-usage"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {
+        "claude": {
+          "enabled": true
+        },
+        "codex": {
+          "enabled": true
+        },
+        "fireworks": {
+          "enabled": true
+        },
+        "opencode": {
+          "enabled": true
+        },
+        "antigravity": {
+          "enabled": true
+        },
+        "freebuff": {
+          "enabled": true
+        },
+        "pi": {
+          "enabled": true
+        },
+        "gemini": {
+          "enabled": true
+        },
+        "crush": {
+          "enabled": true
+        },
+        "copilot": {
+          "enabled": true
+        },
+        "grok": {
+          "enabled": true
+        },
+        "hermes": {
+          "enabled": true
+        },
+        "cursor": {
+          "enabled": true
+        },
+        "zai": {
+          "enabled": true
+        },
+        "synthetic": {
+          "enabled": true
+        }
+      },
+      "refreshIntervalSec": 900,
+      "notifyOnLimits": "On",
+      "syncMode": "Off",
+      "syncDir": "",
+      "syncFileName": "",
+      "syncDeviceId": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "notifyOnLimits",
+        "type": "enum",
+        "label": "Limit notifications",
+        "options": [
+          "Off",
+          "On"
+        ],
+        "defaultValue": "On",
+        "description": "When On, show one desktop notification the first time a rate-limit window crosses 90%."
+      },
+      {
+        "key": "syncMode",
+        "type": "enum",
+        "label": "Synced aggregation",
+        "options": [
+          "Off",
+          "On"
+        ],
+        "defaultValue": "Off",
+        "description": "When On, write this machine's local usage snapshot and merge snapshots from other machines."
+      },
+      {
+        "key": "syncDir",
+        "type": "path",
+        "label": "Sync folder",
+        "defaultValue": "",
+        "description": "A folder synced by Syncthing, Dropbox, rsync, etc."
+      },
+      {
+        "key": "syncFileName",
+        "type": "string",
+        "label": "Snapshot file name",
+        "defaultValue": "",
+        "description": "Optional. Defaults to <hostname>.json. Use a different file name on each machine, such as laptop.json or desktop.json."
+      },
+      {
+        "key": "syncDeviceId",
+        "type": "string",
+        "label": "Device id",
+        "defaultValue": "",
+        "description": "Optional stable device name used inside synced aggregate snapshots."
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.agents"
+  }
+}

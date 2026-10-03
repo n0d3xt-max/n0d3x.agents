@@ -1,0 +1,241 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Freebuff usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Freebuff usage into one display-ready JSON record.
+
+Freebuff (free Codebuff-based coding agent) stores CLI/Desktop sessions under
+~/.freebuff, ~/.config/freebuff, ~/.codebuff or the npm cache. Session formats
+vary, so this scans JSON/JSONL session files for assistant messages with token
+usage and falls back to counting prompts — the panel renders the same meters,
+TOKENS BY DAY and TOKENS BY MODEL sections as every other provider.
+"""
+
+import argparse
+import glob
+import json
+import os
+import shutil
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "freebuff"
+AGENT_NAME = "Freebuff"
+AUTH_HELP = "Install with `npm i -g freebuff` — no API key needed, it just runs."
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+
+found_roots = []
+
+
+def note_root(path):
+    if path and str(path) not in found_roots:
+        found_roots.append(str(path))
+
+
+def local_day(value):
+    if value is None:
+        return datetime.now().strftime("%Y-%m-%d")
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            return datetime.now().strftime("%Y-%m-%d")
+    text = str(value)
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def file_day(path, fallback=None):
+    if fallback is not None:
+        return local_day(fallback)
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except Exception:
+        return today
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def model_name(raw):
+    value = str(raw or "freebuff").rstrip("/").split("/")[-1]
+    return value if value else "freebuff"
+
+
+def add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write):
+    global today_prompts, today_total_tokens, total_prompts
+    total = input_tokens + output_tokens + cache_read + cache_write
+    if total <= 0:
+        total = 1  # prompt counted, tokens unknown
+        output_tokens = 1
+    total_prompts += 1
+    total_sessions.add(session_key)
+    active_days.add(day)
+    bucket = model_usage.setdefault(model, {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    bucket["inputTokens"] += input_tokens
+    bucket["outputTokens"] += output_tokens
+    bucket["cacheReadInputTokens"] += cache_read
+    bucket["cacheCreationInputTokens"] += cache_write
+    if day in recent:
+        recent[day]["messageCount"] += total
+    if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+        today_total_tokens += total
+        today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def extract_tokens(entry):
+    for key in ("tokens", "usage", "tokenUsage"):
+        tokens = entry.get(key)
+        if isinstance(tokens, dict):
+            cache = tokens.get("cache") or {}
+            if not isinstance(cache, dict):
+                cache = {}
+            return (number(tokens.get("input") or tokens.get("inputTokens") or tokens.get("prompt_tokens")),
+                    number(tokens.get("output") or tokens.get("outputTokens") or tokens.get("completion_tokens")) + number(tokens.get("reasoning")),
+                    number(cache.get("read") or cache.get("cacheRead") or cache.get("prompt_cache_hit_tokens")),
+                    number(cache.get("write") or cache.get("cacheWrite") or cache.get("prompt_cache_miss_tokens")))
+    return (0, 0, 0, 0)
+
+
+def scan_json_file(path):
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return
+    entries = []
+    try:
+        parsed = json.loads(text)
+        entries = parsed if isinstance(parsed, list) else [parsed]
+    except Exception:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or (entry.get("message") or {}).get("role") or "")
+        if role != "assistant":
+            # Codebuff-style: {type: "assistant"/"ai", ...}
+            if str(entry.get("type") or "").lower() not in ("assistant", "ai", "agent"):
+                continue
+        session_key = str(entry.get("sessionId") or entry.get("session_id") or path)
+        t = entry.get("time") or entry.get("timestamp") or entry.get("createdAt") or entry.get("created_at")
+        if isinstance(t, dict):
+            t = t.get("created") or t.get("completed")
+        day = file_day(path, t)
+        model = model_name(entry.get("model") or entry.get("modelID") or entry.get("modelId") or "freebuff")
+        i, o, cr, cw = extract_tokens(entry)
+        # Count only entries that look like real assistant turns.
+        if i or o or cr or cw or role == "assistant" or str(entry.get("type") or "").lower() in ("assistant", "ai"):
+            if not (i or o or cr or cw) and len(str(entry)) < 50:
+                continue
+            add_usage(day, "freebuff:" + session_key, model, i, o, cr, cw)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    home = Path.home()
+    candidates = [
+        "~/.freebuff", "~/.config/freebuff", "~/.local/share/freebuff",
+        "~/.codebuff", "~/.config/codebuff", "~/.local/share/codebuff",
+        "~/.cache/freebuff", "~/.cache/codebuff",
+    ]
+    roots = []
+    for pattern in candidates:
+        p = Path(os.path.expanduser(pattern))
+        if p.exists():
+            roots.append(p)
+            note_root(p)
+    if shutil.which("freebuff"):
+        note_root("freebuff-on-PATH")
+
+    scanned = 0
+    for root in roots:
+        for pattern in ("*.json", "*.jsonl", "**/*.json", "**/*.jsonl"):
+            try:
+                matches = glob.glob(str(root / pattern), recursive=True)[:1000]
+            except Exception:
+                continue
+            for match in matches:
+                try:
+                    if Path(match).stat().st_size > 10_000_000:
+                        continue
+                    scan_json_file(Path(match))
+                    scanned += 1
+                except Exception:
+                    continue
+
+    has_data = total_prompts > 0
+    installed = len(found_roots) > 0
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True if (installed or has_data) else False,
+        "hasLocalStats": True,
+        "hasPromptStats": True,
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_total_tokens,
+        "todayTokensByModel": today_tokens_by_model,
+        "recentDays": [recent[day] for day in recent_dates],
+        "totalPrompts": total_prompts,
+        "totalSessions": len(total_sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+        "modelUsage": model_usage,
+        "limits": [],
+        "tierLabel": "Free" if has_data else "",
+        "usageStatusText": "" if has_data else ("No Freebuff sessions yet" if installed else "Freebuff not found"),
+        "authHelpText": AUTH_HELP,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

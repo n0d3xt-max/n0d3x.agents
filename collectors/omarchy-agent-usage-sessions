@@ -1,0 +1,924 @@
+#!/usr/bin/python3
+# omarchy:summary=Print per-provider session lists as JSON (hidden record)
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Session lists for the Manage view, one hidden record for all providers.
+
+Stock collectors aggregate counts but keep no per-session detail. This
+collector emits sessionsByProvider: {opencode: [...], codex: [...]} with
+{id,title,date,timestamp,tokens,model,directory} per session (newest 30 each).
+The panel merges each list into its provider tab; the record itself carries
+only zeros so it never appears as a tab. Extend PROVIDERS here to wire more.
+"""
+
+import argparse
+import glob
+import json
+import os
+import sqlite3
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+AGENT_ID = "sessions"
+AGENT_NAME = "Sessions"
+LIMIT = 30
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def local_day(value, fallback_path=None):
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    elif value is not None:
+        text = str(value)
+        try:
+            if text.endswith("Z"):
+                dt = datetime.fromisoformat(text[:-1] + "+00:00")
+            else:
+                dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    if fallback_path is not None:
+        try:
+            return datetime.fromtimestamp(fallback_path.stat().st_mtime).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return ""
+
+
+def model_name(raw, fallback="session"):
+    value = str(raw or fallback).rstrip("/").split("/")[-1]
+    return value if value else fallback
+
+
+def opencode_db():
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+
+
+def opencode_cost_by_session():
+    """SUM(message.data.cost) per session. Free-tier usage reports 0 --
+    the field stays honest rather than estimated."""
+    db = opencode_db()
+    if not db.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+    except sqlite3.Error:
+        return {}
+    costs = {}
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        for session_id, raw in conn.execute("SELECT session_id, data FROM message"):
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            cost = entry.get("cost")
+            if isinstance(cost, bool):
+                continue
+            try:
+                cost = float(cost or 0)
+            except (TypeError, ValueError):
+                continue
+            if cost:
+                costs[str(session_id)] = costs.get(str(session_id), 0.0) + cost
+    except sqlite3.Error:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return costs
+
+
+def opencode_sessions():
+    """Newest OpenCode sessions straight from the session table."""
+    db = opencode_db()
+    if not db.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return []
+    out = []
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute(
+            "SELECT id, title, directory, time_created, time_updated,"
+            " tokens_input, tokens_output, tokens_reasoning,"
+            " tokens_cache_read, tokens_cache_write, model"
+            " FROM session ORDER BY time_updated DESC LIMIT ?", (LIMIT,))
+        costs = opencode_cost_by_session()
+        for (sid, title, directory, created, updated, ti, to, tr, cr, cw, model) in rows:
+            try:
+                total = number(ti) + number(to) + number(tr) + number(cr) + number(cw)
+                try:
+                    model_id = json.loads(model).get("id") if model else ""
+                except Exception:
+                    model_id = ""
+                ts = number(updated) or number(created)
+                entry = {
+                    "id": str(sid),
+                    "title": str(title or "Untitled session"),
+                    "date": local_day(ts),
+                    "timestamp": ts,
+                    "tokens": total,
+                    "model": model_name(model_id, "opencode"),
+                    "directory": str(directory or ""),
+                }
+                cost = costs.get(str(sid), 0.0)
+                if cost > 0:
+                    entry["costUsd"] = round(cost, 4)
+                out.append(entry)
+            except Exception:
+                continue
+    except sqlite3.Error:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
+
+
+def opencode_openai_session_ids():
+    """OpenCode sessions that ran on an OpenAI provider (Codex tab members)."""
+    db = opencode_db()
+    if not db.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        return {}
+    found = {}
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        for (session_id,) in conn.execute(
+                "SELECT DISTINCT session_id FROM message WHERE data LIKE '%\"providerID\"%:%\"openai\"%'"):
+            found[str(session_id)] = True
+    except sqlite3.Error:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return found
+
+
+def user_text(entry_payload):
+    """First user-authored text in a Codex response_item payload."""
+    if not isinstance(entry_payload, dict):
+        return ""
+    if entry_payload.get("role") != "user":
+        return ""
+    content = entry_payload.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "input_text":
+                text = str(part.get("text") or "").strip()
+                if text and not text.startswith("<"):
+                    return text
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "input_text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    return text
+    text = str(entry_payload.get("text") or "").strip()
+    return text
+
+
+def usage_tokens(usage):
+    if not isinstance(usage, dict):
+        return (0, 0, 0, 0)
+    i = number(usage.get("input_tokens"))
+    cached = number(usage.get("cached_input_tokens"))
+    cw = number(usage.get("cache_write_input_tokens"))
+    o = number(usage.get("output_tokens")) + number(usage.get("reasoning_output_tokens"))
+    return (max(0, i - cached - cw), o, cached, cw)
+
+
+def scan_native_file(path):
+    """Detail for one native Codex rollout file. None when unreadable."""
+    detail = {"tokens": 0, "model": "codex", "sid": "", "cwd": "", "title": "", "day": "", "ts": 0}
+    try:
+        mtime_ms = int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
+    detail["ts"] = mtime_ms
+    try:
+        handle = path.open(errors="replace")
+    except OSError:
+        return None
+    model = "codex"
+    fallback_title = ""
+    last_thread_usage = None
+    last_legacy_usage = None
+    with handle:
+        for raw in handle:
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            etype = entry.get("type")
+            if etype == "session_meta":
+                meta = entry.get("payload") or {}
+                detail["sid"] = str(meta.get("id") or meta.get("session_id") or "")
+                detail["cwd"] = str(meta.get("cwd") or "")
+                if meta.get("timestamp"):
+                    day = local_day(meta.get("timestamp"))
+                    if day:
+                        detail["day"] = day
+                        try:
+                            detail["ts"] = int(datetime.fromisoformat(
+                                str(meta["timestamp"]).replace("Z", "+00:00")).timestamp() * 1000)
+                        except Exception:
+                            pass
+            elif etype == "turn_context":
+                payload = entry.get("payload") or {}
+                model = model_name(payload.get("model") or payload.get("model_slug") or model, "codex")
+            elif etype == "response_item":
+                payload = entry.get("payload") or {}
+                # Prefer the first real user prompt; installer-injected
+                # <...> texts are only a fallback title.
+                if not detail["title"] or detail["title"].startswith("<"):
+                    text = user_text(payload)
+                    if text:
+                        short = " ".join(text.split())[:60]
+                        if not short.startswith("<"):
+                            detail["title"] = short
+                        elif not fallback_title:
+                            fallback_title = short
+            elif etype == "token_usage_record":
+                payload = entry.get("payload") or {}
+                thread = payload.get("thread_token_usage") or payload.get("usage")
+                if isinstance(thread, dict) and thread:
+                    last_thread_usage = thread
+            else:
+                # Legacy token_count shape (older CLI): cumulative last turn.
+                payload = entry.get("payload") or entry
+                if isinstance(payload, dict):
+                    payload = payload.get("payload") or payload
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info") or {}
+                    if isinstance(info.get("last_token_usage"), dict):
+                        last_legacy_usage = info["last_token_usage"]
+    if last_thread_usage is not None:
+        i, o, cr, cw = usage_tokens(last_thread_usage)
+    elif last_legacy_usage is not None:
+        i, o, cr, cw = usage_tokens(last_legacy_usage)
+    else:
+        i, o, cr, cw = (0, 0, 0, 0)
+    detail["tokens"] = i + o + cr + cw
+    detail["model"] = model
+    if not detail["title"]:
+        detail["title"] = fallback_title
+    if not detail["day"]:
+        detail["day"] = local_day(mtime_ms)
+    if not detail["sid"]:
+        detail["sid"] = path.stem
+    return detail
+
+
+def codex_sessions():
+    """Newest Codex sessions: native rollout files + OpenCode/OpenAI rows."""
+    out = []
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    roots = [codex_home / "sessions", codex_home / "archived_sessions"]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:LIMIT]
+        except OSError:
+            continue
+        for path in files:
+            try:
+                detail = scan_native_file(path)
+            except Exception:
+                continue
+            if detail is None:
+                continue
+            out.append({
+                "id": "file:" + str(path),
+                "title": detail["title"] or path.stem[:60],
+                "date": detail["day"],
+                "timestamp": detail["ts"],
+                "tokens": detail["tokens"],
+                "model": detail["model"],
+                "directory": detail["cwd"],
+            })
+    # OpenCode sessions on an OpenAI provider belong to this tab too.
+    openai_sids = opencode_openai_session_ids()
+    if openai_sids:
+        for session in opencode_sessions():
+            if session["id"] in openai_sids:
+                entry = dict(session)
+                entry["id"] = "opencode:" + session["id"]
+                out.append(entry)
+    out.sort(key=lambda s: (-(s["timestamp"] or 0), -(s["tokens"] or 0)))
+    return out[:LIMIT]
+
+
+def pi_sessions():
+    """Pi/OMP transcripts: every assistant turn counts, any provider key."""
+    out = []
+    roots = [Path.home() / ".pi" / "agent" / "sessions",
+             Path.home() / ".omp" / "agent" / "sessions"]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:LIMIT]
+        except OSError:
+            continue
+        for path in files:
+            try:
+                mtime_ms = int(path.stat().st_mtime * 1000)
+            except OSError:
+                continue
+            tokens = 0
+            model = "pi"
+            title = ""
+            ts = mtime_ms
+            day = local_day(mtime_ms)
+            seen = set()
+            try:
+                with path.open(errors="replace") as handle:
+                    for raw in handle:
+                        try:
+                            entry = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("type") == "message":
+                            message = entry.get("message") or {}
+                            if not isinstance(message, dict):
+                                continue
+                            if message.get("role") == "assistant":
+                                key = str(entry.get("id") or "") + str(message.get("timestamp") or "")
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                usage = message.get("usage") or {}
+                                i = number(usage.get("input")) if isinstance(usage, dict) else 0
+                                o = number(usage.get("output")) if isinstance(usage, dict) else 0
+                                cr = number(usage.get("cacheRead")) if isinstance(usage, dict) else 0
+                                cw = number(usage.get("cacheWrite")) if isinstance(usage, dict) else 0
+                                tokens += i + o + cr + cw
+                                model = model_name(message.get("model") or model, "pi")
+                                ets = entry.get("timestamp") or message.get("timestamp")
+                                if isinstance(ets, (int, float)):
+                                    ms = int(ets * 1000) if ets < 10_000_000_000 else int(ets)
+                                    ts = max(ts, ms)
+                                    day = local_day(ms)
+                            elif message.get("role") == "user" and not title:
+                                text = extract_text(message.get("content"))
+                                if text:
+                                    title = text
+            except OSError:
+                continue
+            if tokens <= 0 and not title:
+                continue
+            out.append({
+                "id": "file:" + str(path),
+                "title": title or path.stem[:60],
+                "date": day,
+                "timestamp": ts,
+                "tokens": tokens,
+                "model": model,
+                "directory": "",
+            })
+    out.sort(key=lambda s: (-(s["timestamp"] or 0), -(s["tokens"] or 0)))
+    return out[:LIMIT]
+
+
+def extract_text(content):
+    """First text string in a message content shape (str, parts, blocks)."""
+    if isinstance(content, str):
+        text = content.strip()
+        return " ".join(text.split())[:60] if text else ""
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                for key in ("text", "input_text", "content"):
+                    value = part.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return " ".join(value.split())[:60]
+                nested = extract_text(part.get("content"))
+                if nested:
+                    return nested
+    if isinstance(content, dict):
+        for key in ("text", "content", "message"):
+            value = content.get(key)
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split())[:60]
+    return ""
+
+
+def gemini_sessions():
+    """Gemini CLI checkpoints. Resume is index-based upstream, so entries
+    carry the project directory for a terminal fallback (see helper)."""
+    out = []
+    matches = sorted(glob.glob(os.path.expanduser("~/.gemini/tmp/*/chats/*.json")),
+                     key=lambda p: os.path.getmtime(p), reverse=True)[:LIMIT]
+    for match in matches:
+        path = Path(match)
+        try:
+            mtime_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        try:
+            parsed = json.loads(path.read_text(errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        directory = ""
+        for key in ("cwd", "projectRoot", "rootPath", "workingDirectory", "project_path"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value:
+                directory = value
+                break
+        if not directory and isinstance(parsed.get("sessionInfo"), dict):
+            for key in ("cwd", "projectRoot"):
+                value = parsed["sessionInfo"].get(key)
+                if isinstance(value, str) and value:
+                    directory = value
+                    break
+        tokens = 0
+        for key in ("tokens", "usage", "tokenUsage", "sessionInfo"):
+            sub = parsed.get(key)
+            if isinstance(sub, dict):
+                tokens = (number(sub.get("inputTokens") or sub.get("input") or sub.get("promptTokenCount"))
+                          + number(sub.get("outputTokens") or sub.get("output") or sub.get("candidatesTokenCount"))
+                          + number(sub.get("cachedContentTokenCount")))
+                if tokens:
+                    break
+        day = local_day(parsed.get("updatedAt") or parsed.get("timestamp"), path)
+        try:
+            ts = int(path.stat().st_mtime * 1000)
+        except OSError:
+            ts = 0
+        out.append({
+            "id": "file:" + str(path),
+            "title": str(parsed.get("name") or parsed.get("tag") or path.stem)[:60],
+            "date": day,
+            "timestamp": ts,
+            "tokens": tokens,
+            "model": model_name(parsed.get("model") or parsed.get("modelId"), "gemini"),
+            "directory": directory,
+        })
+    return out[:LIMIT]
+
+
+def crush_candidate_dbs():
+    home = Path.home()
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share"))
+    candidates = [
+        home / ".crush" / "crush.db",
+        data_home / "crush" / "crush.db",
+        Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config")) / "crush" / "crush.db",
+    ]
+    return [p for p in candidates if p.is_file()]
+
+
+def crush_sessions():
+    """Crush SQLite, schema-introspected (field-unverified: no local DB to
+    test against — implement defensively, skip on any surprise)."""
+    out = []
+    for db in crush_candidate_dbs():
+        try:
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        except Exception:
+            continue
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            cols_of = {}
+            for table in tables:
+                try:
+                    cols_of[table] = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+                except Exception:
+                    cols_of[table] = []
+            sess_table = None
+            for table in tables:
+                cols = [c.lower() for c in cols_of[table]]
+                has_id = any("id" in c for c in cols)
+                has_time = any(k in c for c in cols for k in ("created", "started", "updated", "timestamp", "time"))
+                has_title = any(k in c for c in cols for k in ("title", "summary", "name"))
+                if has_id and has_time and (has_title or "session" in table.lower()):
+                    sess_table = table
+                    break
+            if sess_table is None:
+                continue
+            cols = cols_of[sess_table]
+            low = {c.lower(): c for c in cols}
+            id_col = next((low[c] for c in low if c == "id" or c.endswith("_id") or c == "uuid"), cols[0])
+            time_col = next((low[c] for c in low if any(k in c for k in ("updated_at", "created_at", "started_at", "updated", "created", "started", "timestamp"))), None)
+            title_col = next((low[c] for c in low if any(k in c for k in ("title", "summary", "name"))), None)
+            model_col = next((low[c] for c in low if "model" in c), None)
+            dir_col = next((low[c] for c in low if any(k in c for k in ("cwd", "directory", "project", "workspace"))), None)
+            select = [id_col] + ([c for c in (time_col, title_col, model_col, dir_col) if c])
+            query = f'SELECT {", ".join(chr(34) + c + chr(34) for c in select)} FROM "{sess_table}" ORDER BY ROWID DESC LIMIT {LIMIT}'
+            for row in conn.execute(query):
+                data = dict(zip(select, row))
+                ts_raw = data.get(time_col) if time_col else None
+                ts = 0
+                if isinstance(ts_raw, (int, float)):
+                    ts = int(ts_raw * 1000) if ts_raw < 10_000_000_000 else int(ts_raw)
+                out.append({
+                    "id": "db:" + sess_table + ":" + str(data.get(id_col)),
+                    "title": str(data.get(title_col) or "Crush session")[:60] if title_col else "Crush session",
+                    "date": local_day(ts_raw),
+                    "timestamp": ts,
+                    "tokens": 0,
+                    "model": model_name(data.get(model_col) if model_col else "crush", "crush"),
+                    "directory": str(data.get(dir_col) or "") if dir_col else "",
+                })
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    out.sort(key=lambda s: (-(s["timestamp"] or 0),))
+    return out[:LIMIT]
+
+
+def copilot_sessions():
+    """Copilot CLI session-state dirs (plus legacy flat files). Directory
+    comes from workspace.yaml so resume lands in the project."""
+    out = []
+    override = os.environ.get("COPILOT_HOME", "").strip()
+    home = Path(override) if override else Path.home() / ".copilot"
+    state = home / "session-state"
+    if state.is_dir():
+        try:
+            dirs = sorted([p for p in state.iterdir() if p.is_dir()],
+                          key=lambda p: p.stat().st_mtime, reverse=True)[:LIMIT]
+        except OSError:
+            dirs = []
+        for session_dir in dirs:
+            events = session_dir / "events.jsonl"
+            workspace = session_dir / "workspace.yaml"
+            if not events.is_file() and not workspace.is_file():
+                continue
+            directory = ""
+            if workspace.is_file():
+                try:
+                    import re
+                    text = workspace.read_text(errors="replace")
+                    match = re.search(r"^cwd:\s*(.+?)\s*$", text, re.MULTILINE)
+                    if match:
+                        directory = match.group(1).strip().strip("'\"")
+                except Exception:
+                    pass
+            tokens = 0
+            model = "copilot"
+            title = ""
+            ts = 0
+            try:
+                ts = int(session_dir.stat().st_mtime * 1000)
+            except OSError:
+                pass
+            if events.is_file():
+                try:
+                    with events.open(errors="replace") as handle:
+                        for raw in handle:
+                            raw = raw.strip()
+                            if not raw:
+                                continue
+                            try:
+                                entry = json.loads(raw)
+                            except Exception:
+                                continue
+                            if not isinstance(entry, dict):
+                                continue
+                            role = str(entry.get("role") or "").lower()
+                            kind = str(entry.get("type") or entry.get("event") or "").lower()
+                            if role == "assistant" or any(w in kind for w in ("assistant", "response_complete", "completion")):
+                                for key in ("tokens", "usage", "tokenUsage"):
+                                    sub = entry.get(key)
+                                    if isinstance(sub, dict):
+                                        tokens += (number(sub.get("input") or sub.get("inputTokens"))
+                                                   + number(sub.get("output") or sub.get("outputTokens")))
+                                if entry.get("model"):
+                                    model = model_name(entry.get("model"), "copilot")
+                            elif not title and (role == "user" or "prompt" in kind):
+                                text = extract_text(entry.get("content") or entry.get("text") or entry.get("prompt") or entry.get("message"))
+                                if text:
+                                    title = text
+                except OSError:
+                    pass
+            out.append({
+                "id": "copilot:" + session_dir.name,
+                "title": title or session_dir.name[:60],
+                "date": local_day(ts),
+                "timestamp": ts,
+                "tokens": tokens,
+                "model": model,
+                "directory": directory,
+            })
+    out.sort(key=lambda s: (-(s["timestamp"] or 0), -(s["tokens"] or 0)))
+    return out[:LIMIT]
+
+
+def grok_sessions():
+    """Grok Code sessions: summary.json metadata + signals.json tokens.
+    Group dir names are URL-encoded cwds (slug+hash past 255B, with .cwd)."""
+    out = []
+    override = os.environ.get("GROK_HOME", "").strip()
+    home = Path(override) if override else Path.home() / ".grok"
+    sessions_root = home / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    groups = []
+    try:
+        groups = [p for p in sessions_root.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    for group in groups:
+        directory = ""
+        cwd_file = group / ".cwd"
+        if cwd_file.is_file():
+            try:
+                directory = cwd_file.read_text(errors="replace").strip().splitlines()[0]
+            except Exception:
+                pass
+        if not directory:
+            try:
+                directory = urllib.parse.unquote(group.name)
+            except Exception:
+                pass
+            if directory == group.name and ("/" not in directory and len(directory) > 60):
+                directory = ""
+        try:
+            session_dirs = sorted([p for p in group.iterdir() if p.is_dir()],
+                                  key=lambda p: p.stat().st_mtime, reverse=True)[:LIMIT]
+        except OSError:
+            continue
+        for session_dir in session_dirs:
+            summary = None
+            signals = None
+            try:
+                summary = json.loads((session_dir / "summary.json").read_text(errors="replace"))
+            except Exception:
+                pass
+            try:
+                signals = json.loads((session_dir / "signals.json").read_text(errors="replace"))
+            except Exception:
+                pass
+            if not isinstance(summary, dict) and not isinstance(signals, dict):
+                continue
+            summary = summary if isinstance(summary, dict) else {}
+            tokens = 0
+            if isinstance(signals, dict):
+                for key in ("tokenUsage", "tokens", "usage"):
+                    sub = signals.get(key)
+                    if isinstance(sub, dict):
+                        tokens = (number(sub.get("input") or sub.get("inputTokens"))
+                                  + number(sub.get("output") or sub.get("outputTokens")))
+                        if tokens:
+                            break
+                if not tokens:
+                    tokens = number(signals.get("inputTokens")) + number(signals.get("outputTokens"))
+            ts_raw = summary.get("updatedAt") or summary.get("createdAt")
+            try:
+                ts = int(session_dir.stat().st_mtime * 1000)
+            except OSError:
+                ts = 0
+            day = local_day(ts_raw) if ts_raw else local_day(ts)
+            out.append({
+                "id": session_dir.name,
+                "title": str(summary.get("title") or summary.get("summary") or "Grok session")[:60],
+                "date": day,
+                "timestamp": ts,
+                "tokens": tokens,
+                "model": model_name(summary.get("modelId") or summary.get("model"), "grok"),
+                "directory": directory,
+            })
+    out.sort(key=lambda s: (-(s["timestamp"] or 0), -(s["tokens"] or 0)))
+    return out[:LIMIT]
+
+
+def hermes_state_db():
+    home = Path.home()
+    candidates = [
+        home / ".hermes" / "state.db",
+        Path(os.environ.get("XDG_STATE_HOME") or (home / ".local" / "state")) / "hermes" / "state.db",
+        Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share")) / "hermes" / "state.db",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def hermes_sessions():
+    """Hermes SQLite: sessions rows + per-model usage split."""
+    db = hermes_state_db()
+    if db is None:
+        return []
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return []
+    out = []
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        if "sessions" not in tables:
+            return []
+        usage_by_session = {}
+        if "session_model_usage" in tables:
+            try:
+                for (sid, model, i, o, cr, cw, reasoning, est, act) in conn.execute(
+                        "SELECT session_id, model, input_tokens, output_tokens,"
+                        " cache_read_tokens, cache_write_tokens, reasoning_tokens,"
+                        " estimated_cost_usd, actual_cost_usd"
+                        " FROM session_model_usage"):
+                    bucket = usage_by_session.setdefault(str(sid), {"tokens": 0, "model": "", "cost": 0.0})
+                    bucket["tokens"] += number(i) + number(o) + number(cr) + number(cw) + number(reasoning)
+                    try:
+                        # Actual ledger wins when present; estimates fill gaps.
+                        paid = float(act or 0) or float(est or 0)
+                    except (TypeError, ValueError):
+                        paid = 0.0
+                    if paid > 0:
+                        bucket["cost"] += paid
+                    if not bucket["model"]:
+                        bucket["model"] = model_name(model, "hermes")
+            except Exception:
+                pass
+        rows = conn.execute(
+            "SELECT id, display_name, model, started_at, ended_at,"
+            " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
+            " reasoning_tokens, cwd FROM sessions ORDER BY started_at DESC LIMIT ?", (LIMIT,))
+        for (sid, name, model, started, ended, i, o, cr, cw, reasoning, cwd) in rows:
+            key = str(sid)
+            ts_raw = ended or started
+            ts = int(ts_raw * 1000) if isinstance(ts_raw, (int, float)) and ts_raw > 0 else 0
+            if key in usage_by_session:
+                tokens = usage_by_session[key]["tokens"]
+                model = usage_by_session[key]["model"] or model
+                cost = usage_by_session[key]["cost"]
+            else:
+                tokens = number(i) + number(o) + number(cr) + number(cw) + number(reasoning)
+                cost = 0.0
+            entry = {
+                "id": key,
+                "title": str(name or "Hermes session")[:60],
+                "date": local_day(ts_raw),
+                "timestamp": ts,
+                "tokens": tokens,
+                "model": model_name(model, "hermes"),
+                "directory": str(cwd or ""),
+            }
+            if cost > 0:
+                entry["costUsd"] = round(cost, 4)
+            out.append(entry)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out[:LIMIT]
+
+
+def cursor_sessions():
+    """Cursor agent transcripts + sibling meta.json cwd lookup."""
+    out = []
+    override = os.environ.get("CURSOR_CONFIG_DIR", "").strip()
+    home = Path(override) if override else Path.home() / ".cursor"
+    transcripts = sorted(glob.glob(os.path.join(str(home), "projects", "*", "agent-transcripts", "*", "*.jsonl")),
+                         key=lambda p: os.path.getmtime(p), reverse=True)[:LIMIT]
+    for match in transcripts:
+        path = Path(match)
+        chat_id = path.parent.name
+        try:
+            mtime_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        tokens = 0
+        model = "cursor"
+        title = ""
+        try:
+            with path.open(errors="replace") as handle:
+                for raw in handle:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    role = str(entry.get("role") or "").lower()
+                    if role in ("assistant", "model", "ai", "agent"):
+                        for key in ("usage", "tokens", "tokenUsage", "result"):
+                            sub = entry.get(key)
+                            if isinstance(sub, dict):
+                                tokens += (number(sub.get("inputTokens") or sub.get("input"))
+                                           + number(sub.get("outputTokens") or sub.get("output")))
+                        if entry.get("model"):
+                            model = model_name(entry.get("model"), "cursor")
+                    elif not title and role in ("user", "human"):
+                        text = extract_text(entry.get("content") or entry.get("text"))
+                        if text:
+                            title = text
+        except OSError:
+            continue
+        directory = ""
+        metas = glob.glob(os.path.join(str(home), "chats", "*", chat_id, "meta.json"))
+        if metas:
+            try:
+                meta = json.loads(Path(metas[0]).read_text(errors="replace"))
+                if isinstance(meta, dict) and isinstance(meta.get("cwd"), str):
+                    directory = meta["cwd"]
+            except Exception:
+                pass
+        out.append({
+            "id": chat_id,
+            "title": title or (chat_id[:60]),
+            "date": local_day(mtime_ms),
+            "timestamp": mtime_ms,
+            "tokens": tokens,
+            "model": model,
+            "directory": directory,
+        })
+    return out[:LIMIT]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    by_provider = {
+        "opencode": opencode_sessions(),
+        "codex": codex_sessions(),
+        "pi": pi_sessions(),
+        "gemini": gemini_sessions(),
+        "crush": crush_sessions(),
+        "copilot": copilot_sessions(),
+        "grok": grok_sessions(),
+        "hermes": hermes_sessions(),
+        "cursor": cursor_sessions(),
+    }
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": False,
+        "hasLocalStats": False,
+        "hasPromptStats": False,
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDays": 0,
+        "activeDates": [],
+        "modelUsage": {},
+        "tierLabel": "",
+        "usageStatusText": "",
+        "authHelpText": "",
+        "limits": [],
+        "sessionsByProvider": by_provider,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

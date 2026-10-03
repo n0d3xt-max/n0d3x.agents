@@ -1,0 +1,198 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Hermes usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Hermes Agent usage into one display-ready JSON record.
+
+Hermes keeps a SQLite session store at ~/.hermes/state.db: the sessions table
+carries per-session token counts (input/output/cache/reasoning) and the
+session_model_usage table carries the per-model breakdown. No limits endpoint
+exists, so the panel shows the same TOKENS BY DAY / TOKENS BY MODEL sections
+with no LIMITS block. The panel only ever reads the JSON this prints.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "hermes"
+AGENT_NAME = "Hermes"
+AUTH_HELP = "Run `hermes` to start a session."
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+
+
+def state_db():
+    home = Path.home()
+    candidates = [
+        home / ".hermes" / "state.db",
+        Path(os.environ.get("XDG_STATE_HOME") or (home / ".local" / "state")) / "hermes" / "state.db",
+        Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share")) / "hermes" / "state.db",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def local_day(value):
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            return today
+    return today
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def model_name(raw):
+    value = str(raw or "hermes").rstrip("/").split("/")[-1]
+    return value if value else "hermes"
+
+
+def add_tokens(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write):
+    global today_total_tokens
+    total = input_tokens + output_tokens + cache_read + cache_write
+    if total <= 0:
+        return
+    bucket = model_usage.setdefault(model, {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    bucket["inputTokens"] += input_tokens
+    bucket["outputTokens"] += output_tokens
+    bucket["cacheReadInputTokens"] += cache_read
+    bucket["cacheCreationInputTokens"] += cache_write
+    if day in recent:
+        recent[day]["messageCount"] += total
+    if day == today:
+        today_total_tokens += total
+        today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def bump_session(day, session_key):
+    global today_prompts, total_prompts
+    total_prompts += 1
+    total_sessions.add(session_key)
+    active_days.add(day)
+    if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+
+
+def scan_db(path):
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return False
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        if "sessions" not in tables:
+            return False
+        # Per-model usage first (authoritative token split with activity window).
+        model_rows = []
+        if "session_model_usage" in tables:
+            try:
+                model_rows = list(conn.execute(
+                    "SELECT session_id, model, input_tokens, output_tokens,"
+                    " cache_read_tokens, cache_write_tokens, reasoning_tokens,"
+                    " first_seen, last_seen FROM session_model_usage"))
+            except Exception:
+                model_rows = []
+        usage_by_session = {}
+        for (session_id, model, i, o, cr, cw, reasoning, first_seen, last_seen) in model_rows:
+            key = str(session_id)
+            bucket = usage_by_session.setdefault(key, [])
+            bucket.append((model_name(model), number(i), number(o) + number(reasoning), number(cr), number(cw),
+                           last_seen or first_seen))
+        for row in conn.execute(
+                "SELECT id, model, started_at, ended_at, message_count,"
+                " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
+                " reasoning_tokens FROM sessions"):
+            (session_id, model, started_at, ended_at, message_count,
+             i, o, cr, cw, reasoning) = row
+            key = "hermes:" + str(session_id)
+            day = local_day(ended_at or started_at)
+            bump_session(day, key)
+            model = model_name(model)
+            if key in usage_by_session:
+                for (m, mi, mo, mcr, mcw, _seen) in usage_by_session[key]:
+                    add_tokens(day, key, m, mi, mo, mcr, mcw)
+            else:
+                add_tokens(day, key, model, number(i), number(o) + number(reasoning), number(cr), number(cw))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    db = state_db()
+    if db is not None:
+        scan_db(db)
+
+    has_data = total_prompts > 0
+    installed = db is not None
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True if (installed or has_data) else False,
+        "hasLocalStats": True,
+        "tierLabel": "",
+        "usageStatusText": "" if has_data else ("No Hermes sessions yet" if installed else "Hermes not found"),
+        "authHelpText": AUTH_HELP,
+        "limits": [],
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_total_tokens,
+        "todayTokensByModel": today_tokens_by_model,
+        "recentDays": [recent[day] for day in recent_dates],
+        "totalPrompts": total_prompts,
+        "totalSessions": len(total_sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+        "modelUsage": model_usage,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Copilot CLI usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect GitHub Copilot CLI usage into one display-ready JSON record.
+
+Each session keeps an event log at ~/.copilot/session-state/<id>/events.jsonl
+(legacy flat <id>.jsonl), with ~/.copilot/session-store.db as a turn index.
+Assistant turns are counted and any reported token usage is attributed per
+model. There is no local quota endpoint, so the panel shows the same TOKENS
+BY DAY / TOKENS BY MODEL sections with no LIMITS block. $COPILOT_HOME is
+honored. The panel only ever reads the JSON this prints.
+"""
+
+import argparse
+import glob
+import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "copilot"
+AGENT_NAME = "Copilot"
+AUTH_HELP = "Run `copilot` and sign in with your GitHub account."
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+
+
+def copilot_home():
+    override = os.environ.get("COPILOT_HOME", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".copilot"
+
+
+def local_day(value, fallback_path=None):
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    elif value is not None:
+        text = str(value)
+        try:
+            if text.endswith("Z"):
+                dt = datetime.fromisoformat(text[:-1] + "+00:00")
+            else:
+                dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    if fallback_path is not None:
+        try:
+            return datetime.fromtimestamp(fallback_path.stat().st_mtime).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return today
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def model_name(raw):
+    value = str(raw or "copilot").rstrip("/").split("/")[-1]
+    return value if value else "copilot"
+
+
+def add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write):
+    global today_prompts, today_total_tokens, total_prompts
+    total = input_tokens + output_tokens + cache_read + cache_write
+    if total <= 0:
+        total = 1
+        output_tokens = 1
+    total_prompts += 1
+    total_sessions.add(session_key)
+    active_days.add(day)
+    bucket = model_usage.setdefault(model, {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    bucket["inputTokens"] += input_tokens
+    bucket["outputTokens"] += output_tokens
+    bucket["cacheReadInputTokens"] += cache_read
+    bucket["cacheCreationInputTokens"] += cache_write
+    if day in recent:
+        recent[day]["messageCount"] += total
+    if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+        today_total_tokens += total
+        today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def harvest_tokens(entry):
+    for key in ("tokens", "usage", "tokenUsage"):
+        sub = entry.get(key)
+        if isinstance(sub, dict):
+            cache = sub.get("cache") or {}
+            if not isinstance(cache, dict):
+                cache = {}
+            i = number(sub.get("input") or sub.get("inputTokens") or sub.get("prompt_tokens"))
+            o = number(sub.get("output") or sub.get("outputTokens") or sub.get("completion_tokens"))
+            cr = number(cache.get("read"))
+            cw = number(cache.get("write"))
+            if i or o or cr or cw:
+                return (i, o, cr, cw)
+    return (0, 0, 0, 0)
+
+
+def is_assistant_event(entry):
+    if not isinstance(entry, dict):
+        return False
+    role = str(entry.get("role") or "").lower()
+    if role == "assistant":
+        return True
+    kind = str(entry.get("type") or entry.get("event") or entry.get("name") or "").lower()
+    return any(word in kind for word in ("assistant", "response_complete", "completion", "answer"))
+
+
+def scan_events_file(path, session_key):
+    try:
+        handle = path.open(errors="replace")
+    except Exception:
+        return 0
+    counted = 0
+    with handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not is_assistant_event(entry):
+                continue
+            i, o, cr, cw = harvest_tokens(entry)
+            day = local_day(entry.get("timestamp") or entry.get("ts") or entry.get("time") or entry.get("createdAt"), path)
+            add_usage(day, session_key, model_name(entry.get("model") or entry.get("modelId")), i, o, cr, cw)
+            counted += 1
+    return counted
+
+
+def scan_session_store(db_path):
+    # Fallback index: one row per turn (user message + final answer).
+    try:
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return 0
+    counted = 0
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        if "turns" not in tables:
+            return 0
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(turns)")]
+        session_col = "session_id" if "session_id" in cols else ("id" if "id" in cols else None)
+        for row in conn.execute("SELECT * FROM turns"):
+            data = dict(zip(cols, row))
+            key = "copilot:" + str(data.get(session_col) or "unknown")
+            add_usage(today if total_prompts == 0 and counted == 0 else today, key, "copilot", 0, 0, 0, 0)
+            counted += 1
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return counted
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    home = copilot_home()
+    state = home / "session-state"
+    event_files = []
+    if state.is_dir():
+        event_files += sorted(glob.glob(str(state / "*" / "events.jsonl")))
+        event_files += sorted(glob.glob(str(state / "*.jsonl")))
+    for match in event_files[:2000]:
+        path = Path(match)
+        session_key = "copilot:" + path.parent.name if path.name == "events.jsonl" else "copilot:" + path.stem
+        try:
+            scan_events_file(path, session_key)
+        except Exception:
+            continue
+    if total_prompts == 0:
+        store = home / "session-store.db"
+        if store.is_file():
+            scan_session_store(store)
+
+    has_data = total_prompts > 0
+    installed = home.exists()
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True if (installed or has_data) else False,
+        "hasLocalStats": True,
+        "tierLabel": "",
+        "usageStatusText": "" if has_data else ("No Copilot sessions yet" if installed else "Copilot CLI not found"),
+        "authHelpText": AUTH_HELP,
+        "limits": [],
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_total_tokens,
+        "todayTokensByModel": today_tokens_by_model,
+        "recentDays": [recent[day] for day in recent_dates],
+        "totalPrompts": total_prompts,
+        "totalSessions": len(total_sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+        "modelUsage": model_usage,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,62 @@
+#!/bin/bash
+# n0d3x.agents extras: regenerate usage records for providers the stock
+# omarchy-agent-usage-update does not know (opencode, antigravity, freebuff,
+# pi, gemini, crush, copilot, grok, hermes, cursor, zai, synthetic).
+# Same CLI contract: [--force] [--limits-only] [--except <agent>] [agent...]
+
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+mkdir -p "$USAGE_DIR"
+
+EXTRA_AGENTS=(opencode antigravity freebuff pi gemini crush copilot grok hermes cursor zai synthetic sessions)
+
+flags=()
+only=()
+declare -A excluded
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --force | --limits-only) flags+=("$1") ;;
+  --except)
+    excluded[$2]=1
+    shift
+    ;;
+  *) only+=("$1") ;;
+  esac
+  shift
+done
+
+wanted() {
+  local agent="$1"
+  [[ -n ${excluded[$agent]:-} ]] && return 1
+  (( ${#only[@]} == 0 )) && return 0
+  local candidate
+  for candidate in "${only[@]}"; do
+    # Stock agent names (claude/codex/...) never match extras: skip quietly.
+    [[ $candidate == "$agent" ]] && return 0
+  done
+  return 1
+}
+
+collect() {
+  local agent="$1"
+  local collector="$HOME/.local/bin/omarchy-agent-usage-$agent"
+  [[ -x $collector ]] || return 0
+  local record tmp
+  if ! record=$("$collector" "${flags[@]}") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+    echo "n0d3x-agents-update: $agent collector failed" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$USAGE_DIR/.$agent.XXXXXX")
+  printf '%s\n' "$record" >"$tmp"
+  mv "$tmp" "$USAGE_DIR/$agent.json"
+}
+
+status=0
+ran=0
+for agent in "${EXTRA_AGENTS[@]}"; do
+  if wanted "$agent"; then
+    collect "$agent" || status=1
+    ran=1
+  fi
+done
+exit $status

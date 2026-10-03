@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Z.ai usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Z.ai GLM Coding Plan quota into one display-ready JSON record.
+
+Quota comes from the api.z.ai usage monitor: a 5-hour session token window, a
+7-day token window, and the monthly web-search allowance, plus the plan level
+(lite/standard/pro). The key comes from ZAI_API_KEY or the zai-coding-plan/zai
+entry in opencode's auth.json. Quota numbers are account-global (scope
+"account") so synced devices never double-count them. The panel only ever
+reads the JSON this prints.
+"""
+
+import argparse
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+AGENT_ID = "zai"
+AGENT_NAME = "Z.ai"
+AUTH_HELP = "Set ZAI_API_KEY or sign in to zai-coding-plan in opencode."
+QUOTA_URL = os.environ.get("ZAI_QUOTA_URL", "https://api.z.ai/api/monitor/usage/quota/limit")
+ALLOWED_DOMAIN = "z.ai"
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    # urllib would copy headers (including the bearer key) onto the redirect
+    # target, potentially leaking the key cross-host. Never follow.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class ZaiError(Exception):
+    pass
+
+
+def trusted_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as error:
+        raise ZaiError("Z.ai endpoint URL is invalid") from error
+    if parts.scheme != "https":
+        raise ZaiError("Z.ai endpoint must use HTTPS")
+    host = (parts.hostname or "").lower()
+    if host != ALLOWED_DOMAIN and not host.endswith("." + ALLOWED_DOMAIN):
+        raise ZaiError("Z.ai endpoint host is not trusted")
+    return url
+
+
+def base_record(**overrides):
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": False,
+        "hasLocalStats": False,
+        "scope": "account",
+        "hasPromptStats": False,
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDays": 0,
+        "activeDates": [],
+        "modelUsage": {},
+        "tierLabel": "",
+        "usageStatusText": "",
+        "authHelpText": "",
+        "limits": [],
+    }
+    record.update(overrides)
+    return record
+
+
+def api_key():
+    key = os.environ.get("ZAI_API_KEY", "").strip()
+    if key:
+        return key
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+    try:
+        parsed = json.loads((data_home / "opencode" / "auth.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    for entry_id in ("zai-coding-plan", "zai"):
+        entry = parsed.get(entry_id)
+        if isinstance(entry, dict):
+            key = str(entry.get("key") or "").strip()
+            if key:
+                return key
+    return ""
+
+
+def fetch_quota(key):
+    request = urllib.request.Request(
+        trusted_url(QUOTA_URL),
+        headers={"Accept": "application/json", "Authorization": "Bearer " + key},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=15) as response:
+            decoded = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise ZaiError("Z.ai rejected the API key") from error
+        raise ZaiError(f"Z.ai API returned HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise ZaiError("Could not reach the Z.ai API") from error
+    except (json.JSONDecodeError, TimeoutError) as error:
+        raise ZaiError("Z.ai returned an invalid quota response") from error
+    if not isinstance(decoded, dict) or not decoded.get("success"):
+        raise ZaiError("Z.ai reported an unsuccessful quota response")
+    data = decoded.get("data")
+    if not isinstance(data, dict):
+        raise ZaiError("Z.ai returned an empty quota response")
+    return data
+
+
+def reset_at(entry):
+    try:
+        stamp = datetime.fromtimestamp(float(entry.get("nextResetTime")) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+    return stamp.isoformat().replace("+00:00", "Z")
+
+
+def window_label(entry):
+    kind = str(entry.get("type") or "")
+    unit = entry.get("unit")
+    number = entry.get("number")
+    if kind == "TIME_LIMIT":
+        return "Search (monthly)" if (unit, number) == (5, 1) else "Search"
+    if kind == "TOKENS_LIMIT":
+        if (unit, number) == (3, 5):
+            return "Session (5-hour)"
+        if (unit, number) == (6, 1):
+            return "Weekly (7-day)"
+    return "Tokens"
+
+
+def to_limits(data):
+    limits = []
+    entries = data.get("limits")
+    if not isinstance(entries, list):
+        return limits
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            percent = min(1.0, max(0.0, float(entry.get("percentage") or 0) / 100))
+        except (TypeError, ValueError):
+            continue
+        limits.append({"label": window_label(entry), "percent": percent, "resetsAt": reset_at(entry)})
+    return limits
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    try:
+        key = api_key()
+        if not key:
+            record = base_record(usageStatusText="Z.ai unavailable", authHelpText=AUTH_HELP)
+        else:
+            data = fetch_quota(key)
+            level = str(data.get("level") or "").strip()
+            record = base_record(
+                ready=True,
+                tierLabel=("Coding Plan " + level.capitalize()) if level else "Coding Plan",
+                limits=to_limits(data),
+            )
+    except ZaiError as error:
+        record = base_record(usageStatusText="Z.ai unavailable", authHelpText=str(error))
+    except Exception:
+        record = base_record(usageStatusText="Z.ai unavailable", authHelpText="Z.ai usage scan failed")
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

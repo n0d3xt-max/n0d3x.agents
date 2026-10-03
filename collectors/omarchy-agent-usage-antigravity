@@ -1,0 +1,248 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Antigravity usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Antigravity usage into one display-ready JSON record.
+
+Antigravity (Google's agentic IDE) keeps transcripts under ~/.gemini/antigravity*
+and state in ~/.config/Antigravity. Token breakdowns are not exposed the way
+Claude/Codex expose them, so this counts prompts/sessions/days — the panel
+renders those with the exact same meters, TOKENS BY DAY and TOKENS BY MODEL
+sections as every other provider. Record contract matches the stock collectors.
+"""
+
+import argparse
+import glob
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "antigravity"
+AGENT_NAME = "Antigravity"
+AUTH_HELP = "Launch Antigravity and sign in with your Google account."
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+
+found_roots = []
+
+
+def note_root(path):
+    if path and str(path) not in found_roots:
+        found_roots.append(str(path))
+
+
+def local_day(value):
+    if value is None:
+        return datetime.now().strftime("%Y-%m-%d")
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            return datetime.now().strftime("%Y-%m-%d")
+    text = str(value)
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def add_prompt(day, session_key, model, tokens):
+    global today_prompts, today_total_tokens, total_prompts
+    total_prompts += 1
+    total_sessions.add(session_key)
+    active_days.add(day)
+    bucket = model_usage.setdefault(model or "antigravity", {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    # Without a token API, one prompt counts as one unit so the
+    # week chart and model breakdown still move with real activity.
+    bucket["outputTokens"] += tokens if tokens else 1
+    if day in recent:
+        recent[day]["messageCount"] += tokens if tokens else 1
+    if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+        today_total_tokens += tokens if tokens else 1
+        today_tokens_by_model[model or "antigravity"] = today_tokens_by_model.get(model or "antigravity", 0) + (tokens if tokens else 1)
+
+
+def scan_transcript(path):
+    session_key = str(path.parent.parent) if len(path.parts) > 2 else str(path)
+    try:
+        with path.open(errors="replace") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                role = str(entry.get("role") or entry.get("source") or entry.get("author") or "").upper()
+                # deja-vu mapping: USER_EXPLICIT -> user, MODEL -> assistant
+                if role in ("MODEL", "ASSISTANT", "AI"):
+                    is_assistant = True
+                elif role in ("USER_EXPLICIT", "USER", "HUMAN"):
+                    continue
+                elif entry.get("type") == "message" and isinstance(entry.get("message"), dict):
+                    msg = entry["message"]
+                    if str(msg.get("role") or "") != "assistant":
+                        continue
+                    is_assistant = True
+                else:
+                    continue
+                if not is_assistant:
+                    continue
+                usage = entry.get("usage") or (entry.get("message") or {}).get("usage") or {}
+                tokens = 0
+                if isinstance(usage, dict):
+                    tokens = number(usage.get("totalTokens")) or number(usage.get("total")) or (
+                        number(usage.get("input")) + number(usage.get("output")))
+                day = local_day(entry.get("created_at") or entry.get("timestamp") or entry.get("createdAt"))
+                try:
+                    day = local_day(path.stat().st_mtime) if day == today and path.stat().st_size == 0 else day
+                except Exception:
+                    pass
+                model = str(entry.get("model") or (entry.get("message") or {}).get("model") or "antigravity")
+                add_prompt(day, session_key, model, tokens)
+    except Exception:
+        return
+
+
+def scan_state_db(path):
+    # state.vscdb holds trajectorySummaries (titles/timestamps/workspaces).
+    # Read-only: count conversations per day as prompts when transcripts are absent.
+    import sqlite3
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        try:
+            rows = conn.execute("SELECT key, value FROM ItemTable WHERE key LIKE '%trajectory%'").fetchall()
+        except Exception:
+            return
+        for key, value in rows:
+            try:
+                data = json.loads(value) if isinstance(value, (bytes, str)) else None
+            except Exception:
+                continue
+            items = data if isinstance(data, list) else (data.get("summaries") if isinstance(data, dict) else None)
+            if not isinstance(items, list):
+                continue
+            note_root(path)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ts = item.get("updatedAt") or item.get("timestamp") or item.get("createdAt")
+                day = local_day(ts)
+                session_key = "antigravity:" + str(item.get("id") or item.get("conversationId") or key)
+                add_prompt(day, session_key, "antigravity", 0)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    home = Path.home()
+    for pattern in ("~/.gemini/antigravity*", "~/.gemini/antigravity-*/brain"):
+        for root in glob.glob(os.path.expanduser(pattern)):
+            p = Path(root)
+            if p.exists():
+                note_root(p)
+    gemini_root = home / ".gemini"
+    # NOTE: ~/.gemini alone is Gemini CLI, not Antigravity — only
+    # antigravity-specific roots (matched above) count as installed.
+    for transcript in glob.glob(os.path.expanduser("~/.gemini/antigravity*/brain/*/logs/transcript.jsonl")) + \
+            glob.glob(os.path.expanduser("~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl")):
+        scan_transcript(Path(transcript))
+    for state_db in glob.glob(os.path.expanduser("~/.config/Antigravity/User/globalStorage/state.vscdb")) + \
+            glob.glob(os.path.expanduser("~/.config/Antigravity*/User/globalStorage/state.vscdb")):
+        if Path(state_db).is_file():
+            scan_state_db(Path(state_db))
+
+    # Fallback: any conversation-ish JSON under Antigravity dirs counts activity.
+    if total_prompts == 0:
+        for pattern in ("~/.config/Antigravity/**/conversations/*.json", "~/.gemini/antigravity*/**/conversation*.json"):
+            for match in glob.glob(os.path.expanduser(pattern), recursive=True)[:500]:
+                try:
+                    p = Path(match)
+                    day = local_day(p.stat().st_mtime)
+                    add_prompt(day, "antigravity:" + str(p), "antigravity", 0)
+                except Exception:
+                    continue
+
+    has_data = total_prompts > 0
+    installed = len(found_roots) > 0 or (home / ".config" / "Antigravity").exists()
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True if (installed or has_data) else False,
+        "hasLocalStats": True,
+        "hasPromptStats": True,
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_total_tokens,
+        "todayTokensByModel": today_tokens_by_model,
+        "recentDays": [recent[day] for day in recent_dates],
+        "totalPrompts": total_prompts,
+        "totalSessions": len(total_sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+        "modelUsage": model_usage,
+        "limits": [],
+        "tierLabel": "Pro" if has_data else "",
+        "usageStatusText": "" if has_data else ("No Antigravity sessions yet" if installed else "Antigravity not found"),
+        "authHelpText": AUTH_HELP,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

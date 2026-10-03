@@ -1,0 +1,455 @@
+#!/bin/bash
+# n0d3x-agents-session: resume or delete one provider session for the
+# n0d3x.agents Manage view.
+#
+#   n0d3x-agents-session resume <provider> <session-key> [directory]
+#   n0d3x-agents-session delete <provider> <session-key>
+#
+# Session keys are the ids the usage/sessions record emits: plain OpenCode
+# session ids, or "opencode:<sid>" / "file:<path>" for Codex tab members.
+# Every destructive path validates its target before touching anything.
+
+set -u
+
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+OPENCODE_DB="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/agent-usage"
+
+fail() {
+  echo "n0d3x-agents-session: $*" >&2
+  exit 1
+}
+
+valid_opencode_id() {
+  [[ $1 =~ ^ses_[A-Za-z0-9]+$ ]]
+}
+
+launch_in_terminal() {
+  # $1 = directory, remaining args = command to exec there.
+  local dir="$1"
+  shift
+  [[ -d $dir ]] || dir="$HOME/Work"
+  [[ -d $dir ]] || dir="$HOME"
+  # Fully detached: the panel must never wait on an interactive terminal.
+  setsid omarchy launch terminal bash -c 'cd "$0" && exec "$@"' "$dir" "$@" &>/dev/null &
+  disown || true
+}
+
+opencode_directory() {
+  # $1 = session id -> prints its directory (empty when unknown).
+  python3 - "$OPENCODE_DB" "$1" <<'EOF' 2>/dev/null
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True, timeout=2)
+    row = conn.execute('SELECT directory FROM session WHERE id = ?', (sys.argv[2],)).fetchone()
+    print(row[0] if row and row[0] else '')
+except Exception:
+    print('')
+EOF
+}
+
+codex_native_session_id() {
+  # $1 = rollout file -> prints the session id from session_meta (empty when unknown).
+  python3 - "$1" <<'EOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], errors='replace') as handle:
+        for raw in handle:
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(entry, dict) and entry.get('type') == 'session_meta':
+                meta = entry.get('payload') or {}
+                sid = str(meta.get('id') or meta.get('session_id') or '')
+                if sid:
+                    print(sid)
+                    break
+except Exception:
+    pass
+EOF
+}
+
+# --- file-confined session roots (resume + delete stay inside these) ---
+
+pi_session_file() {
+  # $1 = session key -> prints resolved transcript path or fails.
+  local path="$1"
+  [[ $path == file:* ]] && path="${path#file:}"
+  local resolved
+  resolved=$(realpath -m "$path" 2>/dev/null) || return 1
+  local root
+  for root in "$HOME/.pi/agent/sessions" "$HOME/.omp/agent/sessions"; do
+    if [[ $resolved == "$root"/* && -f $resolved && $resolved == *.jsonl ]]; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+gemini_checkpoint_file() {
+  local path="$1"
+  [[ $path == file:* ]] && path="${path#file:}"
+  local resolved
+  resolved=$(realpath -m "$path" 2>/dev/null) || return 1
+  local root="$HOME/.gemini/tmp"
+  if [[ $resolved == "$root"/* && -f $resolved && $resolved == *.json ]]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  return 1
+}
+
+copilot_session_dir() {
+  # $1 = "copilot:<id>" -> prints resolved session dir or fails.
+  local id="${1#copilot:}"
+  [[ $id =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  local base="${COPILOT_HOME:-$HOME/.copilot}/session-state"
+  local resolved
+  resolved=$(realpath -m "$base/$id" 2>/dev/null) || return 1
+  local allowed
+  allowed=$(realpath -m "$base" 2>/dev/null) || return 1
+  if [[ $resolved == "$allowed"/* && -d $resolved ]] &&
+    [[ -f $resolved/events.jsonl || -f $resolved/workspace.yaml ]]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  return 1
+}
+
+grok_session_dir() {
+  # $1 = session id -> prints resolved session dir or fails.
+  local id="$1"
+  [[ $id =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  local base="${GROK_HOME:-$HOME/.grok}/sessions"
+  local allowed
+  allowed=$(realpath -m "$base" 2>/dev/null) || return 1
+  [[ -d $allowed ]] || return 1
+  local group dir
+  for group in "$allowed"/*/; do
+    [[ -d $group ]] || continue
+    dir="$group$id"
+    if [[ -d $dir && -f $dir/summary.json ]]; then
+      printf '%s' "$(realpath -m "$dir")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cursor_transcript_dir() {
+  # $1 = chat id -> prints resolved transcript dir or fails.
+  local id="$1"
+  [[ $id =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  local base="${CURSOR_CONFIG_DIR:-$HOME/.cursor}/projects"
+  local allowed
+  allowed=$(realpath -m "$base" 2>/dev/null) || return 1
+  [[ -d $allowed ]] || return 1
+  local proj dir
+  for proj in "$allowed"/*/; do
+    [[ -d $proj ]] || continue
+    dir="$proj/agent-transcripts/$id"
+    if [[ -d $dir && -f $dir/$id.jsonl ]]; then
+      printf '%s' "$(realpath -m "$dir")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cursor_session_cwd() {
+  # $1 = chat id -> prints meta.json cwd or empty.
+  local id="$1"
+  local base="${CURSOR_CONFIG_DIR:-$HOME/.cursor}/chats"
+  [[ -d $base ]] || return 0
+  python3 - "$base" "$id" <<'EOF' 2>/dev/null
+import glob, json, sys
+for match in glob.glob(f"{sys.argv[1]}/*/meta.json"):
+    if f"/{sys.argv[2]}/meta.json" in match.replace("\\", "/"):
+        try:
+            meta = json.load(open(match, errors="replace"))
+            if isinstance(meta, dict) and isinstance(meta.get("cwd"), str):
+                print(meta["cwd"])
+                break
+        except Exception:
+            pass
+EOF
+}
+
+hermes_session_row() {
+  # $1 = session id -> prints "cwd" when the row exists, else fails.
+  local sid="$1"
+  [[ $sid =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  local db="$HOME/.hermes/state.db"
+  [[ -f $db ]] || return 1
+  python3 - "$db" "$sid" <<'EOF' 2>/dev/null
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=2)
+    row = conn.execute("SELECT cwd FROM sessions WHERE id = ?", (sys.argv[2],)).fetchone()
+    if row is None:
+        raise SystemExit(1)
+    print(row[0] or "")
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)
+EOF
+}
+
+crush_session_id() {
+  # $1 = "db:<table>:<id>" -> prints "dbpath|table|id" after validating the
+  # DB is a known Crush database and the row exists. Field-unverified path:
+  # Crush schema is introspected live (no local DB to test against yet).
+  local key="$1"
+  [[ $key =~ ^db:[A-Za-z0-9_]+:[A-Za-z0-9_.-]+$ ]] || return 1
+  local table="${key#db:}"; table="${table%%:*}"
+  local sid="${key##*:}"
+  local db
+  for db in "$HOME/.crush/crush.db" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/crush/crush.db" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/crush/crush.db"; do
+    [[ -f $db ]] || continue
+    if python3 - "$db" "$table" "$sid" <<'EOF' 2>/dev/null
+import sqlite3, sys
+db, table, sid = sys.argv[1], sys.argv[2], sys.argv[3]
+if not table.replace("_", "").isalnum():
+    raise SystemExit(1)
+try:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    if table not in tables:
+        raise SystemExit(1)
+    cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+    id_col = next((c for c in cols if c.lower() == "id" or c.lower().endswith("_id") or c.lower() == "uuid"), None)
+    if id_col is None:
+        raise SystemExit(1)
+    row = conn.execute(f'SELECT 1 FROM "{table}" WHERE "{id_col}" = ?', (sid,)).fetchone()
+    if row is None:
+        raise SystemExit(1)
+    print(f"{db}|{table}|{id_col}|{sid}")
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)
+EOF
+    then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_resume() {
+  local provider="$1" key="$2" directory="${3:-}"
+  case "$provider" in
+  opencode)
+    valid_opencode_id "$key" || fail "refusing to resume unknown OpenCode session '$key'"
+    [[ -n $directory ]] || directory=$(opencode_directory "$key")
+    launch_in_terminal "$directory" opencode -s "$key"
+    ;;
+  pi)
+    path=$(pi_session_file "$key") || fail "refusing to resume unknown Pi session"
+    launch_in_terminal "$directory" pi --session "$path"
+    ;;
+  gemini)
+    # Upstream resume is index-based (--resume latest|N), not addressable by
+    # checkpoint file: open the project terminal on plain `gemini` and let
+    # the in-TUI /resume picker take it from there.
+    path=$(gemini_checkpoint_file "$key") || fail "refusing to resume unknown Gemini session"
+    [[ -n $directory ]] || directory="$HOME/Work"
+    launch_in_terminal "$directory" gemini
+    ;;
+  crush)
+    ref=$(crush_session_id "$key") || fail "refusing to resume unknown Crush session"
+    sid="${ref##*|}"
+    launch_in_terminal "$directory" crush --session "$sid"
+    ;;
+  copilot)
+    dir=$(copilot_session_dir "$key") || fail "refusing to resume unknown Copilot session"
+    sid="${key#copilot:}"
+    [[ -n $directory ]] || directory="$dir"
+    launch_in_terminal "$directory" copilot --resume "$sid"
+    ;;
+  grok)
+    dir=$(grok_session_dir "$key") || fail "refusing to resume unknown Grok session"
+    [[ -n $directory ]] || directory="$dir"
+    launch_in_terminal "$directory" grok --resume "$key"
+    ;;
+  hermes)
+    cwd=$(hermes_session_row "$key") || fail "refusing to resume unknown Hermes session"
+    [[ -n $directory ]] || directory="$cwd"
+    launch_in_terminal "$directory" hermes --resume "$key"
+    ;;
+  cursor)
+    dir=$(cursor_transcript_dir "$key") || fail "refusing to resume unknown Cursor session"
+    cwd=$(cursor_session_cwd "$key")
+    [[ -n $directory ]] || directory="$cwd"
+    launch_in_terminal "$directory" cursor-agent --resume "$key"
+    ;;
+  codex)
+    if [[ $key == opencode:* ]]; then
+      local sid="${key#opencode:}"
+      valid_opencode_id "$sid" || fail "refusing to resume unknown OpenCode session '$sid'"
+      [[ -n $directory ]] || directory=$(opencode_directory "$sid")
+      launch_in_terminal "$directory" opencode -s "$sid"
+      return
+    fi
+    local path="$key"
+    [[ $path == file:* ]] && path="${path#file:}"
+    # Guard: only rollout files under the Codex session roots may be resumed.
+    local resolved
+    resolved=$(realpath -m "$path" 2>/dev/null) || fail "cannot resolve session path"
+    local allowed1="$HOME/.codex/sessions" allowed2="$HOME/.codex/archived_sessions"
+    [[ -n ${CODEX_HOME:-} ]] && allowed1="$CODEX_HOME/sessions" && allowed2="$CODEX_HOME/archived_sessions"
+    [[ $resolved == "$allowed1"/* || $resolved == "$allowed2"/* ]] || fail "refusing to resume outside Codex sessions"
+    [[ -f $resolved ]] || fail "session file is gone"
+    local sid
+    sid=$(codex_native_session_id "$resolved")
+    if [[ -n $sid ]]; then
+      launch_in_terminal "${directory:-$HOME/Work}" codex resume "$sid"
+    else
+      launch_in_terminal "${directory:-$HOME/Work}" codex resume
+    fi
+    ;;
+  *)
+    fail "session resume is not wired for provider '$provider' yet"
+    ;;
+  esac
+  echo "resumed $provider session"
+}
+
+cmd_delete() {
+  local provider="$1" key="$2"
+  case "$provider" in
+  opencode)
+    valid_opencode_id "$key" || fail "refusing to delete unknown OpenCode session '$key'"
+    [[ -f $OPENCODE_DB ]] || fail "OpenCode database not found"
+    python3 - "$OPENCODE_DB" "$key" <<'EOF' || fail "session delete failed"
+import sqlite3, sys
+db, sid = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db, timeout=5)
+try:
+    conn.execute('PRAGMA foreign_keys = ON')
+    conn.execute('DELETE FROM part WHERE session_id = ?', (sid,))
+    conn.execute('DELETE FROM message WHERE session_id = ?', (sid,))
+    conn.execute('DELETE FROM session_share WHERE session_id = ?', (sid,))
+    cur = conn.execute('DELETE FROM session WHERE id = ?', (sid,))
+    if cur.rowcount < 1:
+        raise SystemExit(f'session {sid} not found')
+    conn.commit()
+finally:
+    conn.close()
+EOF
+    rm -f "$CACHE_DIR"/opencode-scan-*.json "$CACHE_DIR"/opencode-scan-*.lock
+    "$HOME/.local/bin/n0d3x-agents-update" --force opencode sessions >/dev/null 2>&1 || true
+    # The Codex tab also counts OpenCode sessions: refresh its record too.
+    omarchy-agent-usage-update --force codex >/dev/null 2>&1 || true
+    ;;
+  codex)
+    if [[ $key == opencode:* ]]; then
+      local sid="${key#opencode:}"
+      cmd_delete opencode "$sid"
+      return
+    fi
+    local path="$key"
+    [[ $path == file:* ]] && path="${path#file:}"
+    local resolved
+    resolved=$(realpath -m "$path" 2>/dev/null) || fail "cannot resolve session path"
+    local allowed1="$HOME/.codex/sessions" allowed2="$HOME/.codex/archived_sessions"
+    [[ -n ${CODEX_HOME:-} ]] && allowed1="$CODEX_HOME/sessions" && allowed2="$CODEX_HOME/archived_sessions"
+    [[ $resolved == "$allowed1"/* || $resolved == "$allowed2"/* ]] || fail "refusing to delete outside Codex sessions"
+    [[ -f $resolved ]] || fail "session file is already gone"
+    rm -f "$resolved" || fail "could not delete session file"
+    omarchy-agent-usage-update --force codex >/dev/null 2>&1 || true
+    "$HOME/.local/bin/n0d3x-agents-update" --force sessions >/dev/null 2>&1 || true
+    ;;
+  pi)
+    path=$(pi_session_file "$key") || fail "refusing to delete unknown Pi session"
+    rm -f "$path" || fail "could not delete Pi session file"
+    "$HOME/.local/bin/n0d3x-agents-update" --force pi sessions >/dev/null 2>&1 || true
+    ;;
+  gemini)
+    path=$(gemini_checkpoint_file "$key") || fail "refusing to delete unknown Gemini session"
+    rm -f "$path" || fail "could not delete Gemini checkpoint"
+    "$HOME/.local/bin/n0d3x-agents-update" --force gemini sessions >/dev/null 2>&1 || true
+    ;;
+  crush)
+    ref=$(crush_session_id "$key") || fail "refusing to delete unknown Crush session"
+    python3 - "$ref" <<'EOF' || fail "Crush session delete failed"
+import sqlite3, sys
+db, table, id_col, sid = sys.argv[1].split("|", 3)
+conn = sqlite3.connect(db, timeout=5)
+try:
+    conn.execute("PRAGMA foreign_keys = ON")
+    cur = conn.execute(f'DELETE FROM "{table}" WHERE "{id_col}" = ?', (sid,))
+    if cur.rowcount < 1:
+        raise SystemExit(f"session {sid} not found")
+    conn.commit()
+finally:
+    conn.close()
+EOF
+    "$HOME/.local/bin/n0d3x-agents-update" --force crush sessions >/dev/null 2>&1 || true
+    ;;
+  copilot)
+    dir=$(copilot_session_dir "$key") || fail "refusing to delete unknown Copilot session"
+    rm -rf "$dir" || fail "could not delete Copilot session dir"
+    "$HOME/.local/bin/n0d3x-agents-update" --force copilot sessions >/dev/null 2>&1 || true
+    ;;
+  grok)
+    dir=$(grok_session_dir "$key") || fail "refusing to delete unknown Grok session"
+    rm -rf "$dir" || fail "could not delete Grok session dir"
+    "$HOME/.local/bin/n0d3x-agents-update" --force grok sessions >/dev/null 2>&1 || true
+    ;;
+  hermes)
+    cwd=$(hermes_session_row "$key") || fail "refusing to delete unknown Hermes session"
+    python3 - "$HOME/.hermes/state.db" "$key" <<'EOF' || fail "Hermes session delete failed"
+import sqlite3, sys
+db, sid = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db, timeout=5)
+try:
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+    try:
+        conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (sid,))
+    except Exception:
+        pass
+    cur = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+    if cur.rowcount < 1:
+        raise SystemExit(f"session {sid} not found")
+    conn.commit()
+finally:
+    conn.close()
+EOF
+    "$HOME/.local/bin/n0d3x-agents-update" --force hermes sessions >/dev/null 2>&1 || true
+    ;;
+  cursor)
+    dir=$(cursor_transcript_dir "$key") || fail "refusing to delete unknown Cursor session"
+    rm -rf "$dir" || fail "could not delete Cursor transcript dir"
+    "$HOME/.local/bin/n0d3x-agents-update" --force cursor sessions >/dev/null 2>&1 || true
+    ;;
+  *)
+    fail "session delete is not wired for provider '$provider' yet"
+    ;;
+  esac
+  echo "deleted $provider session"
+}
+
+usage() {
+  echo "Usage: n0d3x-agents-session resume <provider> <session-key> [directory]" >&2
+  echo "       n0d3x-agents-session delete <provider> <session-key>" >&2
+  exit 2
+}
+
+[[ $# -ge 3 ]] || usage
+action="$1"
+provider="$2"
+key="$3"
+extra="${4:-}"
+
+case "$action" in
+resume) cmd_resume "$provider" "$key" "$extra" ;;
+delete) cmd_delete "$provider" "$key" ;;
+*) usage ;;
+esac

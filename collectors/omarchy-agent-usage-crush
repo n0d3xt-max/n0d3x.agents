@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Crush usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Crush usage into one display-ready JSON record.
+
+Crush keeps sessions in SQLite (global data dir, default ~/.crush/crush.db).
+The schema is introspected at runtime so the collector survives Crush
+upgrades: it looks for session/message-shaped tables, counts assistant turns,
+and sums whatever token columns exist. No limits endpoint exists, so the
+panel shows the same TOKENS BY DAY / TOKENS BY MODEL sections with no LIMITS
+block.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "crush"
+AGENT_NAME = "Crush"
+AUTH_HELP = "Run `crush` to start a session."
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+today_tokens_by_model = {}
+model_usage = {}
+today_sessions = set()
+active_days = set()
+
+today_prompts = 0
+today_total_tokens = 0
+total_prompts = 0
+total_sessions = set()
+
+
+def candidate_dbs():
+    home = Path.home()
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share"))
+    candidates = [
+        home / ".crush" / "crush.db",
+        data_home / "crush" / "crush.db",
+        Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config")) / "crush" / "crush.db",
+    ]
+    return [p for p in candidates if p.is_file()]
+
+
+def local_day(value):
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:  # ms vs s
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            return today
+    if value is not None:
+        text = str(value)
+        try:
+            if text.endswith("Z"):
+                dt = datetime.fromisoformat(text[:-1] + "+00:00")
+            else:
+                dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        try:
+            return local_day(float(text))
+        except Exception:
+            pass
+    return today
+
+
+def number(value):
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def model_name(raw):
+    value = str(raw or "crush").rstrip("/").split("/")[-1]
+    return value if value else "crush"
+
+
+def add_usage(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write):
+    global today_prompts, today_total_tokens, total_prompts
+    total = input_tokens + output_tokens + cache_read + cache_write
+    if total <= 0:
+        total = 1
+        output_tokens = 1
+    total_prompts += 1
+    total_sessions.add(session_key)
+    active_days.add(day)
+    bucket = model_usage.setdefault(model, {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    bucket["inputTokens"] += input_tokens
+    bucket["outputTokens"] += output_tokens
+    bucket["cacheReadInputTokens"] += cache_read
+    bucket["cacheCreationInputTokens"] += cache_write
+    if day in recent:
+        recent[day]["messageCount"] += total
+    if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+        today_total_tokens += total
+        today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+
+def columns(conn, table):
+    try:
+        return [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+    except Exception:
+        return []
+
+
+def pick(candidates, *names):
+    lowered = {c.lower(): c for c in candidates}
+    for name in names:
+        if name in lowered:
+            return lowered[name]
+    for col in candidates:
+        cl = col.lower()
+        for name in names:
+            if name in cl:
+                return col
+    return None
+
+
+def scan_db(path):
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return False
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+    try:
+        # Message-shaped table: has a role column.
+        msg_table = None
+        for table in tables:
+            cols = columns(conn, table)
+            if pick(cols, "role") and (pick(cols, "content", "text", "body", "message") or pick(cols, "tokens", "token")):
+                msg_table = table
+                break
+        if msg_table:
+            cols = columns(conn, msg_table)
+            role_col = pick(cols, "role")
+            session_col = pick(cols, "session_id", "sessionid", "conversation_id", "chat_id") or "session_id"
+            model_col = pick(cols, "model", "model_id", "modelid")
+            time_col = pick(cols, "created_at", "createdat", "timestamp", "time", "created")
+            in_col = pick(cols, "input_tokens", "inputtokens", "prompt_tokens", "prompttokens")
+            out_col = pick(cols, "output_tokens", "outputtokens", "completion_tokens", "completiontokens")
+            tok_col = pick(cols, "tokens", "token_count", "tokencount", "total_tokens", "totaltokens")
+            select = [role_col, session_col]
+            if model_col:
+                select.append(model_col)
+            if time_col:
+                select.append(time_col)
+            for col in (in_col, out_col, tok_col):
+                if col and col not in select:
+                    select.append(col)
+            query = f'SELECT {", ".join(chr(34) + c + chr(34) for c in select)} FROM "{msg_table}"'
+            for row in conn.execute(query):
+                data = dict(zip(select, row))
+                if str(data.get(role_col) or "").lower() not in ("assistant", "model", "ai", "agent"):
+                    continue
+                i = number(data.get(in_col)) if in_col else 0
+                o = number(data.get(out_col)) if out_col else 0
+                t = number(data.get(tok_col)) if tok_col else 0
+                if t and not (i or o):
+                    i = t
+                day = local_day(data.get(time_col)) if time_col else today
+                add_usage(day, "crush:" + str(data.get(session_col)),
+                          model_name(data.get(model_col) if model_col else "crush"), i, o, 0, 0)
+            return True
+        # Session-shaped table fallback: count sessions/days.
+        sess_table = None
+        for table in tables:
+            cols = columns(conn, table)
+            if pick(cols, "title", "summary", "name") or (pick(cols, "id", "uuid") and pick(cols, "created_at", "createdat", "created", "started_at")):
+                sess_table = table
+                break
+        if sess_table:
+            cols = columns(conn, sess_table)
+            id_col = pick(cols, "id", "uuid", "session_id") or cols[0]
+            time_col = pick(cols, "created_at", "createdat", "created", "started_at", "updated_at", "timestamp")
+            model_col = pick(cols, "model", "model_id")
+            for row in conn.execute(f'SELECT * FROM "{sess_table}"'):
+                data = dict(zip(cols, row))
+                day = local_day(data.get(time_col)) if time_col else today
+                add_usage(day, "crush:" + str(data.get(id_col)),
+                          model_name(data.get(model_col) if model_col else "crush"), 0, 0, 0, 0)
+            return True
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    dbs = candidate_dbs()
+    for db in dbs:
+        scan_db(db)
+
+    has_data = total_prompts > 0
+    installed = len(dbs) > 0
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True if (installed or has_data) else False,
+        "hasLocalStats": True,
+        "tierLabel": "",
+        "usageStatusText": "" if has_data else ("No Crush sessions yet" if installed else "Crush not found"),
+        "authHelpText": AUTH_HELP,
+        "limits": [],
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_total_tokens,
+        "todayTokensByModel": today_tokens_by_model,
+        "recentDays": [recent[day] for day in recent_dates],
+        "totalPrompts": total_prompts,
+        "totalSessions": len(total_sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+        "modelUsage": model_usage,
+    }
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

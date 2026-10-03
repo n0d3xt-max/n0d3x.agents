@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Synthetic usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Synthetic (synthetic.new) quotas into one display-ready JSON record.
+
+Quotas come from api.synthetic.new/v2/quotas: a rolling 5-hour token budget, a
+weekly token budget, and the hourly search allowance (plus legacy subscription
+/ daily free-tool-call counts when an account reports those). The key comes
+from SYNTHETIC_API_KEY or the synthetic entry in opencode's auth.json. Quota
+numbers are account-global (scope "account") so synced devices never
+double-count them. The panel only ever reads the JSON this prints.
+"""
+
+import argparse
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+AGENT_ID = "synthetic"
+AGENT_NAME = "Synthetic"
+AUTH_HELP = "Set SYNTHETIC_API_KEY or sign in to synthetic in opencode."
+QUOTA_URL = os.environ.get("SYNTHETIC_QUOTA_URL", "https://api.synthetic.new/v2/quotas")
+ALLOWED_DOMAIN = "synthetic.new"
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    # urllib would copy headers (including the bearer key) onto the redirect
+    # target, potentially leaking the key cross-host. Never follow.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class SyntheticError(Exception):
+    pass
+
+
+def trusted_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as error:
+        raise SyntheticError("Synthetic endpoint URL is invalid") from error
+    if parts.scheme != "https":
+        raise SyntheticError("Synthetic endpoint must use HTTPS")
+    host = (parts.hostname or "").lower()
+    if host != ALLOWED_DOMAIN and not host.endswith("." + ALLOWED_DOMAIN):
+        raise SyntheticError("Synthetic endpoint host is not trusted")
+    return url
+
+
+def base_record(**overrides):
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": False,
+        "hasLocalStats": False,
+        "scope": "account",
+        "hasPromptStats": False,
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDays": 0,
+        "activeDates": [],
+        "modelUsage": {},
+        "tierLabel": "Flat rate",
+        "usageStatusText": "",
+        "authHelpText": "",
+        "limits": [],
+    }
+    record.update(overrides)
+    return record
+
+
+def api_key():
+    key = os.environ.get("SYNTHETIC_API_KEY", "").strip()
+    if key:
+        return key
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+    try:
+        parsed = json.loads((data_home / "opencode" / "auth.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    entry = parsed.get("synthetic")
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("key") or "").strip()
+
+
+def fetch_quotas(key):
+    request = urllib.request.Request(
+        trusted_url(QUOTA_URL),
+        headers={"Accept": "application/json", "Authorization": "Bearer " + key},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=15) as response:
+            decoded = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise SyntheticError("Synthetic rejected the API key") from error
+        raise SyntheticError(f"Synthetic API returned HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise SyntheticError("Could not reach the Synthetic API") from error
+    except (json.JSONDecodeError, TimeoutError) as error:
+        raise SyntheticError("Synthetic returned an invalid quota response") from error
+    if not isinstance(decoded, dict):
+        raise SyntheticError("Synthetic returned an invalid quota response")
+    return decoded
+
+
+def resets_at(entry, *keys):
+    if not isinstance(entry, dict):
+        return ""
+    for key in keys:
+        raw = str(entry.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return stamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            continue
+    return ""
+
+
+def used_fraction(entry):
+    try:
+        limit = float(entry.get("limit") or 0)
+        used = float(entry.get("requests") or 0)
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    return min(1.0, max(0.0, used / limit))
+
+
+def remaining_fraction(entry):
+    try:
+        maximum = float(entry.get("max") or 0)
+        remaining = float(entry.get("remaining") or 0)
+    except (TypeError, ValueError):
+        return None
+    if maximum <= 0:
+        return None
+    return min(1.0, max(0.0, 1 - remaining / maximum))
+
+
+def weekly_fraction(entry):
+    try:
+        remaining_percent = float(entry.get("percentRemaining"))
+    except (TypeError, ValueError):
+        return None
+    return min(1.0, max(0.0, 1 - remaining_percent / 100))
+
+
+def to_limits(data):
+    limits = []
+
+    def add(label, percent, reset):
+        if percent is None:
+            return
+        limits.append({"label": label, "percent": percent, "resetsAt": reset})
+
+    rolling = data.get("rollingFiveHourLimit")
+    if isinstance(rolling, dict):
+        add("Session (5-hour)", remaining_fraction(rolling), resets_at(rolling, "nextTickAt"))
+    else:
+        sub = data.get("subscription")
+        add("Session (5-hour)", used_fraction(sub) if isinstance(sub, dict) else None,
+            resets_at(sub, "renewsAt") if isinstance(sub, dict) else "")
+    weekly = data.get("weeklyTokenLimit")
+    if isinstance(weekly, dict):
+        percent = remaining_fraction(weekly) if "max" in weekly else weekly_fraction(weekly)
+        add("Weekly", percent, resets_at(weekly, "nextRegenAt"))
+    search = data.get("search")
+    if isinstance(search, dict):
+        hourly = search.get("hourly")
+        add("Search (hourly)", used_fraction(hourly) if isinstance(hourly, dict) else None,
+            resets_at(hourly, "renewsAt") if isinstance(hourly, dict) else "")
+    free_calls = data.get("freeToolCalls")
+    add("Tool calls (daily)", used_fraction(free_calls) if isinstance(free_calls, dict) else None,
+        resets_at(free_calls, "renewsAt") if isinstance(free_calls, dict) else "")
+    return limits
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.parse_args()
+
+    try:
+        key = api_key()
+        if not key:
+            record = base_record(usageStatusText="Synthetic unavailable", authHelpText=AUTH_HELP)
+        else:
+            record = base_record(ready=True, limits=to_limits(fetch_quotas(key)))
+    except SyntheticError as error:
+        record = base_record(usageStatusText="Synthetic unavailable", authHelpText=str(error))
+    except Exception:
+        record = base_record(usageStatusText="Synthetic unavailable", authHelpText="Synthetic usage scan failed")
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()
