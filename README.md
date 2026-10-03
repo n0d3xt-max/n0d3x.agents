@@ -24,11 +24,32 @@ Same dashboard, same visual language, zero stock files touched.
 omarchy plugin disable omarchy.agents   # avoid IPC shadowing (stock stays installed)
 omarchy restart shell
 ```
-
 Tabs: Claude, Codex, Fireworks (stock collectors) + OpenCode, Antigravity,
 Freebuff, Pi, Gemini, Crush, Copilot, Grok, Hermes, Cursor, Z.ai, Synthetic.
 A tab appears only once its provider records real usage (or a working quota
 API key, for Z.ai/Synthetic) — installing a CLI alone never creates one.
+
+## Removal
+
+```bash
+omarchy plugin remove n0d3x.agents
+rm -f ~/.local/bin/omarchy-agent-usage-* ~/.local/bin/n0d3x-agents-*
+rm -f ~/.local/state/omarchy/agents/usage/{opencode,antigravity,freebuff,pi,gemini,crush,copilot,grok,hermes,cursor,zai,synthetic,sessions}.json
+omarchy plugin enable omarchy.agents    # restore the stock widget
+omarchy restart shell
+```
+
+## Dependencies
+
+- Omarchy Quattro (shell, `omarchy` CLI) — the plugin host.
+- `python3`, `jq`, `sqlite3` CLI semantics via python's stdlib only
+  (collectors use the standard library; no pip packages).
+- `notify-send` for limit-threshold toasts.
+- Optional per provider: the agent CLIs themselves (`opencode`, `codex`,
+  `pi`, `gemini`, `crush`, `copilot`, `cursor-agent`, `grok`, `hermes`),
+  plus `ZAI_API_KEY` / `SYNTHETIC_API_KEY` (or matching opencode auth
+  entries) for the two API-quota tabs. Missing tools degrade to dormant
+  tabs, never errors.
 
 ## Docs
 
